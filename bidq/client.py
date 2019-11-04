@@ -1,16 +1,8 @@
 import asyncio
-import json
 import uuid
 from inspect import iscoroutinefunction
-from typing import Optional, Tuple, Any
-from dataclasses import dataclass
 from .exceptions import BidqException
-
-
-@dataclass
-class JobState:
-    q: asyncio.Queue
-    state: Optional[Tuple[bool, Any]]
+from .utils import JobState, MessageType, Message
 
 
 lock = True
@@ -38,54 +30,48 @@ class BidQ:
         self._workers = {}
         self._bids = {}
 
-    async def _handle_message(self, message):
-        if message["type"] == "JOB_FAILURE":
-            jid = message["id"]
+    async def _handle_message(self, message: Message):
+        if message.is_a(MessageType.JobFailure):
+            jid = message.id
             if jid in self._jobs:
-                job = self._jobs[jid]
-                job.state = (False, message["reason"])
-                job.q.put_nowait(job.state)
-        elif message["type"] == "JOB_SUCCESS":
-            jid = message["id"]
+                self._jobs[jid].mark_failure(message.reason)
+        elif message.is_a(MessageType.JobSuccess):
+            jid = message.id
             if jid in self._jobs:
-                job = self._jobs[jid]
-                job.state = (True, message.get("value", None))
-                job.q.put_nowait(job.state)
-        elif message["type"] == "SUBMIT":
+                self._jobs[jid].mark_success(message.get("value", None))
+        elif message.is_a(MessageType.Submit):
             if message.get("topic", None) in self._workers:
-                self._bids[message["id"]] = message
-                await self._send(dict(type="BID", id=message["id"]))
-        elif message["type"] == "BID_ACK" or message["type"] == "BID_REJECT":
-            msg = self._bids[message["id"]]
-            del self._bids[message["id"]]
-            if message["type"] == "BID_REJECT":
+                self._bids[message.id] = message
+                await self._send(Message(type=MessageType.Bid.value, id=message.id))
+        elif message.is_a(MessageType.BidAck) or message.is_a(MessageType.BidReject):
+            msg = self._bids[message.id]
+            del self._bids[message.id]
+            if message.is_a(MessageType.BidReject):
                 return
             worker = self._workers[msg.get("topic", None)]
-            task = (
-                worker() if not msg.get("payload", None) else worker(**msg["payload"])
-            )
+            task = worker() if not msg.get("payload", None) else worker(**msg.payload)
             try:
                 value = (await task) if iscoroutinefunction(worker) else task
                 return await self._send(
-                    dict(type="JOB_SUCCESS", id=message["id"], value=value)
+                    Message(type=MessageType.JobSuccess, id=message.id, value=value)
                 )
             except Exception as e:
                 return await self._send(
-                    dict(type="JOB_FAILURE", id=message["id"], reason=str(e))
+                    Message(type=MessageType.JobFailure, id=message.id, reason=str(e))
                 )
 
     async def _handler(self):
         while True:
             try:
                 data = await self.reader.read(1500)
-                msg = json.loads(data)
+                msg = Message.decode(data)
                 self._q.put_nowait(msg)
                 await self._handle_message(msg)
             except asyncio.CancelledError:
                 return
 
-    async def _send(self, message):
-        self.writer.write(json.dumps(message).encode())
+    async def _send(self, message: Message):
+        self.writer.write(message.encode().encode())
         await self.writer.drain()
 
     async def _set_timeout_for(self, jid, timeout):
@@ -98,19 +84,21 @@ class BidQ:
             raise BidqException("Job does not exist")
         if self._jobs[jid].state is not None:
             raise BidqException("Job already done")
-        await self._send(dict(type="CANCEL", id=jid))
+        await self._send(Message(type=MessageType.Cancel, id=jid))
         return self._handle_message(
-            dict(type="JOB_FAILURE", id=jid, reason="Client Timeout")
+            Message(type=MessageType.JobFailure, id=jid, reason="Client Timeout")
         )
 
     async def submit(self, topic, payload=None, timeout=0):
         jid = str(uuid.uuid4())
-        await self._send(dict(type="SUBMIT", id=jid, topic=topic, payload=payload))
+        await self._send(
+            Message(type=MessageType.Submit, id=jid, topic=topic, payload=payload)
+        )
         while True:
             msg = await self._q.get()
-            if msg["type"] == "SUBMIT_ACK" and msg["clientId"] == jid:
-                jid = msg["id"]
-                self._jobs[jid] = JobState(q=asyncio.Queue(), state=None)
+            if msg.is_a(MessageType.SubmitAck) and msg.clientId == jid:
+                jid = msg.id
+                self._jobs[jid] = JobState()
                 if timeout != 0:
                     asyncio.create_task(self._set_timeout_for(jid, timeout))
                 return jid
@@ -120,7 +108,7 @@ class BidQ:
             job = self._jobs[jid]
             result = job.state
             if job.state is None:
-                result = await job.q.get()
+                result = await job.wait_for_value()
             success, value = result
             if not success:
                 raise BidqException(value)
